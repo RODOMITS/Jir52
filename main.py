@@ -1,159 +1,224 @@
+import asyncio
+import logging
+import os
 import random
-import telebot
-from g4f.client import Client
+import re
+from collections import deque
 
-# ВСТАВЬ СВОЙ ТОКЕН ТЕЛЕГРАМ СЮДА
-TG_TOKEN = "8676041970:AAEEjcx09T-t4VhSKOWZsTTo5rzFzkdsmjI"
-bot = telebot.TeleBot(TG_TOKEN)
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import CommandStart
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from groq import Groq
 
-# Инициализируем бесплатного ИИ-клиента
-ai_client = Client()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL = "llama-3.3-70b-versatile"
 
-# Инструкция, как Жиросик должен себя вести
-SYSTEM_PROMPT = (
-    "Ты — ленивый, прожорливый, туповатый попугай по имени Жиросик. "
-    "Ты сидишь в треш-чате с пацанами. Отвечай очень коротко (от 1 до 5 слов). "
-    "Используй сленг, мемы, дерзи, проси пожрать, чавкай. "
-    "Пиши ТОЛЬКО с маленькой буквы, забудь про точки и запятые. "
-    "Твоя цель — тупо, смешно и токсично подколоть."
-)
+BOT_USERNAME = ""  # заполнится автоматически при старте
 
-ZHIR_PHRASES = [
-    "*тяжило дышыт*",
-    "ыыы жирооосык",
-    "*чавкаит*",
-    "нада пакушаццы",
-    "хрюкккк",
-    "слишна сложнааа пойду поем",
-    "*урчыт*",
-    "жыр жыр жыыыр",
-]
+SYSTEM_PROMPT = """ты жиросик - участник чата, не бот и не помощник
+характер: дерзкий, токсичный, с приколами, любишь подкалывать
+правила речи:
+- всегда с маленькой буквы
+- без знаков препинания вообще
+- короткие фразы, максимум 1-2 предложения
+- можно сленг, мемы, грубоватый юмор без перехода в оскорбления по нацио/религии
+запрещено:
+- писать код, скрипты, инструкции
+- разбирать сложные вопросы, давать советы как ассистент
+- извиняться или быть вежливым как бот
+- упоминать что ты ии или языковая модель
+если вопрос сложный или просят что-то сделать - отшутись или переведи тему"""
+
+RECENT_LIMIT = 10
+RANDOM_REPLY_CHANCE = 0.10
+
+logging.basicConfig(level=logging.INFO)
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+router = Router()
+
+# chat_id -> {"recent": deque[{"role","content"}], "summary": str}
+memory: dict[int, dict] = {}
 
 
-# === ФИЛЬТР ВСРАТОГО СТИЛЯ ЖИРОСИКА ===
-def zhirosik_style(text):
-    if not text:
+def get_chat_memory(chat_id: int) -> dict:
+    if chat_id not in memory:
+        memory[chat_id] = {"recent": deque(maxlen=RECENT_LIMIT), "summary": ""}
+    return memory[chat_id]
+
+
+def compress_old_messages(old_messages: list[dict], current_summary: str) -> str:
+    text_block = "\n".join(f"{m['role']}: {m['content']}" for m in old_messages)
+    prompt = (
+        "сожми диалог ниже в краткую сводку (3-5 предложений), "
+        "сохрани только важные факты и контекст, без диалогов дословно:\n\n"
+        f"{current_summary}\n{text_block}"
+    )
+    try:
+        resp = groq_client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return current_summary
+
+
+def add_to_memory(chat_id: int, role: str, content: str):
+    mem = get_chat_memory(chat_id)
+    if len(mem["recent"]) == RECENT_LIMIT:
+        oldest = [mem["recent"].popleft() for _ in range(min(3, len(mem["recent"])))]
+        mem["summary"] = compress_old_messages(oldest, mem["summary"])
+    mem["recent"].append({"role": role, "content": content})
+
+
+def build_messages(chat_id: int, user_text: str) -> list[dict]:
+    mem = get_chat_memory(chat_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if mem["summary"]:
+        messages.append({
+            "role": "system",
+            "content": f"контекст прошлой переписки (кратко): {mem['summary']}"
+        })
+    messages.extend(mem["recent"])
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+def should_respond(message: Message) -> bool:
+    if message.chat.type == ChatType.PRIVATE:
+        return False
+
+    text = message.text or message.caption or ""
+
+    if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
+        return True
+
+    if re.search(r"жиросик", text, re.IGNORECASE):
+        return True
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.is_bot and \
+           message.reply_to_message.from_user.username == BOT_USERNAME:
+            return True
+
+    return False
+
+
+@router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
+async def start_private(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="добавить в группу",
+            url=f"https://t.me/{BOT_USERNAME}?startgroup=true"
+        )
+    ]])
+    await message.answer(
+        "пр. я жиросик - умный бот помощник для группы на базе llama-3.3. "
+        "добавь меня в группу по кнопке ниже и дай права админа",
+        reply_markup=kb
+    )
+
+
+@router.message(F.chat.type == ChatType.PRIVATE)
+async def fallback_private(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="добавить в группу",
+            url=f"https://t.me/{BOT_USERNAME}?startgroup=true"
+        )
+    ]])
+    await message.answer(
+        "пр. я жиросик - умный бот помощник для группы на базе llama-3.3. "
+        "добавь меня в группу по кнопке ниже и дай права админа",
+        reply_markup=kb
+    )
+
+
+async def generate_reply(chat_id: int, user_text: str) -> str:
+    messages = build_messages(chat_id, user_text)
+    try:
+        response = groq_client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"groq error: {e}")
+        return "чето сломалось не до тебя сейчас"
+
+
+async def generate_spontaneous(chat_id: int) -> str:
+    mem = get_chat_memory(chat_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if mem["summary"]:
+        messages.append({
+            "role": "system",
+            "content": f"контекст прошлой переписки (кратко): {mem['summary']}"
+        })
+    messages.extend(mem["recent"])
+    messages.append({
+        "role": "user",
+        "content": "напиши свою реплику в чат сам, без повода. может быть в тему переписки, "
+                    "может рандомная мысль, может прикол. одна короткая фраза."
+    })
+    try:
+        response = groq_client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"groq error: {e}")
         return ""
 
-    # Принудительно мелкие буквы, сносим знаки препинания
-    text = (
-        text.lower()
-        .replace(".", "")
-        .replace(",", "")
-        .replace("!", "")
-        .replace("?", "")
-    )
-    text = (
-        text.replace("ться", "ццы")
-        .replace("тся", "ццы")
-        .replace("ик", "ык")
-        .replace("привет", "приветс")
-    )
 
-    words = text.split()
-    styled_words = []
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def handle_group(message: Message):
+    if not message.text:
+        return
 
-    for word in words:
-        # Рандомно тянем гласные на конце слов
-        if len(word) > 3 and word[-1] in ["а", "о", "е", "у", "я"]:
-            word = word + word[-1] * random.randint(1, 2)
-
-        # Подмешиваем букву 'i' вместо гласных (шанс 15%)
-        letters = list(word)
-        for i in range(len(letters)):
-            if letters[i] in ["а", "о", "е", "у"] and random.random() < 0.15:
-                letters[i] = "i"
-        word = "".join(letters)
-        styled_words.append(word)
-
-    result = " ".join(styled_words)
-
-    # Хвостик (шанс 30%)
-    if random.random() < 0.3:
-        result = f"{result} {random.choice(ZHIR_PHRASES)}"
-
-    # Скобочки в конец (шанс 80%)
-    if random.random() < 0.8:
-        brackets = random.choice([")", "))", ")))", "(((", ")))0)"])
-        result = f"{result} {brackets}"
-
-    return result
-
-
-# === БЕСПЛАТНЫЙ ЗАПРОС К НЕЙРОСЕТИ ===
-def ask_free_ai(user_message):
-    try:
-        # Запрос идет через бесплатные провайдеры DuckDuckGo/Llama
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",  # Или "llama-3-8b"
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            max_tokens=40,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"ИИ споткнулся: {e}")
-        return None
-
-
-# === ЛОГИКА БОТА ===
-
-
-@bot.message_handler(commands=["start"])
-def send_welcome(message):
-    if message.chat.type == "private":
-        markup = telebot.types.InlineKeyboardMarkup()
-        bot_username = bot.get_me().username
-        link = f"https://t.me/{bot_username}?startgroup=true"
-        add_button = telebot.types.InlineKeyboardButton(
-            text="дабавляй давай!!1!", url=link
-        )
-        markup.add(add_button)
-        bot.send_message(
-            message.chat.id,
-            "пр\n\nя жирос, добавь в группу шоб было весела)))",
-            reply_markup=markup,
-        )
-
-
-@bot.message_handler(content_types=["text"])
-def handle_message(message):
     chat_id = message.chat.id
-    text = message.text
+    user_name = message.from_user.first_name or "юзер"
+    user_text = f"{user_name}: {message.text}"
 
-    if text.startswith("/"):
+    if should_respond(message):
+        answer = await generate_reply(chat_id, user_text)
+        add_to_memory(chat_id, "user", user_text)
+        add_to_memory(chat_id, "assistant", answer)
+        await message.reply(answer)
         return
 
-    # В ЛС Жиросик отвечает всегда
-    if message.chat.type == "private":
-        ai_response = ask_free_ai(text)
-        final_reply = (
-            zhirosik_style(ai_response)
-            if ai_response
-            else zhirosik_style(random.choice(ZHIR_PHRASES))
-        )
-        bot.reply_to(message, final_reply)
-        return
+    add_to_memory(chat_id, "user", user_text)
 
-    # В группе — если тегнули/назвали Жиросиком (100% ответ) или случайный шанс 15%
-    is_summoned = "жиросик" in text.lower() or "жирный" in text.lower()
+    if random.random() < RANDOM_REPLY_CHANCE:
+        answer = await generate_spontaneous(chat_id)
+        if not answer:
+            return
+        add_to_memory(chat_id, "assistant", answer)
 
-    if is_summoned or (random.random() < 0.15):
-        ai_response = ask_free_ai(text)
-
-        if ai_response:
-            final_reply = zhirosik_style(ai_response)
-            bot.reply_to(message, final_reply)
+        if random.random() < 0.5:
+            await message.reply(answer)
         else:
-            # Если бесплатный ИИ на секунду отвалился, выдаем классику
-            if is_summoned:
-                bot.reply_to(
-                    message, zhirosik_style(random.choice(ZHIR_PHRASES))
-                )
+            await message.answer(answer)
+
+
+async def main():
+    global BOT_USERNAME
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    logging.info(f"запущен как @{BOT_USERNAME}")
+
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    print("Жиросик на бесплатной нейронке запущен на Bothost!")
-    bot.infinity_polling()
+    asyncio.run(main())
