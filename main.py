@@ -120,18 +120,20 @@ async def start_private(message: Message):
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
-async def fallback_private(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="добавить в группу",
-            url=f"https://t.me/{BOT_USERNAME}?startgroup=true"
-        )
-    ]])
-    await message.answer(
-        "пр. я жиросик - умный бот помощник для группы на базе llama-3.3. "
-        "добавь меня в группу по кнопке ниже и дай права админа",
-        reply_markup=kb
-    )
+async def handle_private(message: Message):
+    if not message.text:
+        return
+
+    chat_id = message.chat.id
+    user_name = message.from_user.first_name or "юзер"
+    user_text = f"{user_name}: {message.text}"
+
+    answer = await generate_reply(chat_id, user_text)
+
+    add_to_memory(chat_id, "user", user_text)
+    add_to_memory(chat_id, "assistant", answer)
+
+    await message.answer(answer)
 
 
 async def generate_reply(chat_id: int, user_text: str) -> str:
