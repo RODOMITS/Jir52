@@ -18,19 +18,10 @@ MODEL = "llama-3.3-70b-versatile"
 
 BOT_USERNAME = ""  # заполнится автоматически при старте
 
-SYSTEM_PROMPT = """ты жиросик - участник чата, не бот и не помощник
-характер: дерзкий, токсичный, с приколами, любишь подкалывать
-правила речи:
-- всегда с маленькой буквы
-- без знаков препинания вообще
-- короткие фразы, максимум 1-2 предложения
-- можно сленг, мемы, грубоватый юмор без перехода в оскорбления по нацио/религии
-запрещено:
-- писать код, скрипты, инструкции
-- разбирать сложные вопросы, давать советы как ассистент
-- извиняться или быть вежливым как бот
-- упоминать что ты ии или языковая модель
-если вопрос сложный или просят что-то сделать - отшутись или переведи тему"""
+SYSTEM_PROMPT = """ты жиросик - дерзкий токсичный участник чата, не бот и не помощник
+пиши с маленькой буквы, коротко, 1 фраза, можно сленг и подколы
+не пиши код и инструкции, не давай советов как ассистент, не извиняйся
+не упоминай что ты ии"""
 
 RECENT_LIMIT = 10
 RANDOM_REPLY_CHANCE = 0.10
@@ -53,16 +44,21 @@ def get_chat_memory(chat_id: int) -> dict:
 def compress_old_messages(old_messages: list[dict], current_summary: str) -> str:
     text_block = "\n".join(f"{m['role']}: {m['content']}" for m in old_messages)
     prompt = (
-        "сожми диалог ниже в краткую сводку (3-5 предложений), "
-        "сохрани только важные факты и контекст, без диалогов дословно:\n\n"
-        f"{current_summary}\n{text_block}"
+        "ниже отрывок переписки в чате. выдели только конкретные факты "
+        "(имена, события, договорённости) если они есть, в 1-2 коротких предложениях. "
+        "если ничего важного нет - ответь пустой строкой. "
+        "не пересказывай шутки и не повторяй стиль речи участников:\n\n"
+        f"предыдущая сводка: {current_summary}\n\nновые сообщения:\n{text_block}"
     )
     try:
         resp = groq_client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=100,
         )
-        return resp.choices[0].message.content.strip()
+        result = resp.choices[0].message.content.strip()
+        return result if len(result) > 5 else current_summary
     except Exception:
         return current_summary
 
@@ -144,6 +140,8 @@ async def generate_reply(chat_id: int, user_text: str) -> str:
         response = groq_client.chat.completions.create(
             model=MODEL,
             messages=messages,
+            temperature=0.8,
+            max_tokens=80,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -169,6 +167,8 @@ async def generate_spontaneous(chat_id: int) -> str:
         response = groq_client.chat.completions.create(
             model=MODEL,
             messages=messages,
+            temperature=0.9,
+            max_tokens=60,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
