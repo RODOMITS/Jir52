@@ -1,2 +1,2 @@
-pyTelegramBotAPI
-g4f
+aiogram>=3.0.0
+groq
